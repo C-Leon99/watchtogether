@@ -1,0 +1,406 @@
+/*
+ * WatchTogether server — zero dependencies, pure Node.js (v18+).
+ * Run with:  node server.js
+ * Then open  http://localhost:3000  in Chrome (and share your address with friends).
+ *
+ * What it does:
+ *  - Serves the app (public/index.html)
+ *  - Stores uploaded movies in ./movies and streams them with seek support
+ *  - WebSocket rooms: synced play/pause/seek, movie selection, chat, trivia scores
+ */
+
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+
+const PORT = process.env.PORT || 3000;
+const PUBLIC_DIR = path.join(__dirname, "public");
+const MOVIE_DIR = path.join(__dirname, "movies");
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024; // 4 GB
+const ALLOWED_EXT = new Set([".mp4", ".webm", ".mkv", ".mov", ".m4v", ".ogg"]);
+
+fs.mkdirSync(MOVIE_DIR, { recursive: true });
+
+/* ------------------------------------------------------------------ */
+/*  HTTP                                                               */
+/* ------------------------------------------------------------------ */
+
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript",
+  ".css": "text/css",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".mkv": "video/x-matroska",
+  ".mov": "video/quicktime",
+  ".m4v": "video/x-m4v",
+  ".ogg": "video/ogg",
+  ".json": "application/json",
+};
+
+function safeName(name) {
+  // keep letters, numbers, spaces, dash, underscore, dot; strip path tricks
+  return path
+    .basename(String(name || ""))
+    .replace(/[^\w.\- ()]/g, "_")
+    .slice(0, 120);
+}
+
+function json(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
+  res.end(body);
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, "http://x");
+  const p = decodeURIComponent(url.pathname);
+
+  /* ---- movie library ---- */
+  if (req.method === "GET" && p === "/api/movies") {
+    const files = fs
+      .readdirSync(MOVIE_DIR)
+      .filter((f) => ALLOWED_EXT.has(path.extname(f).toLowerCase()))
+      .map((f) => {
+        const st = fs.statSync(path.join(MOVIE_DIR, f));
+        return { file: f, size: st.size };
+      })
+      .sort((a, b) => a.file.localeCompare(b.file));
+    return json(res, 200, { movies: files });
+  }
+
+  /* ---- upload: raw body PUT/POST with filename in query ---- */
+  if ((req.method === "POST" || req.method === "PUT") && p === "/api/upload") {
+    const name = safeName(url.searchParams.get("name"));
+    const ext = path.extname(name).toLowerCase();
+    if (!name || !ALLOWED_EXT.has(ext)) {
+      return json(res, 400, { error: "Give the file a video name like movie.mp4 (mp4, webm, mkv, mov, m4v, ogg)." });
+    }
+    const dest = path.join(MOVIE_DIR, name);
+    const tmp = dest + ".part";
+    let received = 0;
+    const out = fs.createWriteStream(tmp);
+
+    req.on("data", (chunk) => {
+      received += chunk.length;
+      if (received > MAX_UPLOAD_BYTES) {
+        req.destroy();
+        out.destroy();
+        fs.rm(tmp, { force: true }, () => {});
+      }
+    });
+    req.pipe(out);
+    out.on("finish", () => {
+      fs.rename(tmp, dest, (err) => {
+        if (err) return json(res, 500, { error: "Could not save the file." });
+        json(res, 200, { ok: true, file: name, size: received });
+        broadcastAll({ type: "library" }); // tell every room the library changed
+      });
+    });
+    out.on("error", () => {
+      fs.rm(tmp, { force: true }, () => {});
+      json(res, 500, { error: "Upload failed while writing to disk." });
+    });
+    return;
+  }
+
+  /* ---- movie streaming with Range support (lets the player seek) ---- */
+  if (req.method === "GET" && p.startsWith("/movies/")) {
+    const name = safeName(p.slice("/movies/".length));
+    const file = path.join(MOVIE_DIR, name);
+    if (!name || !fs.existsSync(file)) {
+      res.writeHead(404);
+      return res.end("Not found");
+    }
+    const st = fs.statSync(file);
+    const type = MIME[path.extname(name).toLowerCase()] || "application/octet-stream";
+    const range = req.headers.range;
+    if (range) {
+      const m = /bytes=(\d*)-(\d*)/.exec(range) || [];
+      let start = m[1] ? parseInt(m[1], 10) : 0;
+      let end = m[2] ? parseInt(m[2], 10) : st.size - 1;
+      if (isNaN(start) || start >= st.size) start = 0;
+      if (isNaN(end) || end >= st.size) end = st.size - 1;
+      res.writeHead(206, {
+        "Content-Type": type,
+        "Accept-Ranges": "bytes",
+        "Content-Range": `bytes ${start}-${end}/${st.size}`,
+        "Content-Length": end - start + 1,
+      });
+      fs.createReadStream(file, { start, end }).pipe(res);
+    } else {
+      res.writeHead(200, { "Content-Type": type, "Content-Length": st.size, "Accept-Ranges": "bytes" });
+      fs.createReadStream(file).pipe(res);
+    }
+    return;
+  }
+
+  /* ---- static app files ---- */
+  if (req.method === "GET") {
+    let rel = p === "/" ? "/index.html" : p;
+    const file = path.join(PUBLIC_DIR, path.normalize(rel));
+    if (file.startsWith(PUBLIC_DIR) && fs.existsSync(file) && fs.statSync(file).isFile()) {
+      const type = MIME[path.extname(file).toLowerCase()] || "application/octet-stream";
+      res.writeHead(200, { "Content-Type": type });
+      return fs.createReadStream(file).pipe(res);
+    }
+  }
+
+  res.writeHead(404);
+  res.end("Not found");
+});
+
+/* ------------------------------------------------------------------ */
+/*  WebSocket (from scratch — no libraries)                            */
+/* ------------------------------------------------------------------ */
+
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/** room code -> room */
+const rooms = new Map();
+/** every connected socket */
+const allClients = new Set();
+
+function makeRoom(code) {
+  return {
+    code,
+    clients: new Set(),
+    state: {
+      movie: null,      // filename in ./movies
+      playing: false,
+      time: 0,          // seconds at the moment of updatedAt
+      updatedAt: Date.now(),
+    },
+    scores: {},         // name -> points
+    round: 0,
+  };
+}
+
+function roomCurrentTime(room) {
+  const s = room.state;
+  if (!s.playing) return s.time;
+  return s.time + (Date.now() - s.updatedAt) / 1000;
+}
+
+function send(sock, obj) {
+  if (sock.destroyed) return;
+  const payload = Buffer.from(JSON.stringify(obj));
+  let header;
+  if (payload.length < 126) {
+    header = Buffer.from([0x81, payload.length]);
+  } else if (payload.length < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(payload.length, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x81;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(payload.length), 2);
+  }
+  sock.write(Buffer.concat([header, payload]));
+}
+
+function broadcast(room, obj, except) {
+  for (const c of room.clients) if (c !== except) send(c, obj);
+}
+function broadcastAll(obj) {
+  for (const c of allClients) send(c, obj);
+}
+
+function presence(room) {
+  return {
+    type: "presence",
+    users: [...room.clients].map((c) => c.userName),
+    scores: room.scores,
+  };
+}
+
+function fullSync(room) {
+  return {
+    type: "sync",
+    movie: room.state.movie,
+    playing: room.state.playing,
+    time: roomCurrentTime(room),
+    round: room.round,
+  };
+}
+
+server.on("upgrade", (req, sock) => {
+  const key = req.headers["sec-websocket-key"];
+  if (!key || req.url !== "/ws") {
+    sock.destroy();
+    return;
+  }
+  const accept = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
+  sock.write(
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+      "Upgrade: websocket\r\n" +
+      "Connection: Upgrade\r\n" +
+      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+  );
+
+  sock.userName = "Guest";
+  sock.room = null;
+  allClients.add(sock);
+
+  let buffer = Buffer.alloc(0);
+
+  sock.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    // parse as many complete frames as we have
+    while (true) {
+      if (buffer.length < 2) return;
+      const fin = (buffer[0] & 0x80) !== 0;
+      const opcode = buffer[0] & 0x0f;
+      const masked = (buffer[1] & 0x80) !== 0;
+      let len = buffer[1] & 0x7f;
+      let offset = 2;
+      if (len === 126) {
+        if (buffer.length < 4) return;
+        len = buffer.readUInt16BE(2);
+        offset = 4;
+      } else if (len === 127) {
+        if (buffer.length < 10) return;
+        len = Number(buffer.readBigUInt64BE(2));
+        offset = 10;
+      }
+      const maskLen = masked ? 4 : 0;
+      if (buffer.length < offset + maskLen + len) return; // wait for more data
+
+      let payload = buffer.subarray(offset + maskLen, offset + maskLen + len);
+      if (masked) {
+        const mask = buffer.subarray(offset, offset + 4);
+        const un = Buffer.alloc(len);
+        for (let i = 0; i < len; i++) un[i] = payload[i] ^ mask[i % 4];
+        payload = un;
+      }
+      buffer = buffer.subarray(offset + maskLen + len);
+
+      if (opcode === 0x8) { // close
+        cleanup(sock);
+        sock.end();
+        return;
+      }
+      if (opcode === 0x9) { // ping -> pong
+        const pong = Buffer.concat([Buffer.from([0x8a, payload.length]), payload]);
+        sock.write(pong);
+        continue;
+      }
+      if (opcode === 0x1 && fin) {
+        let msg;
+        try { msg = JSON.parse(payload.toString("utf8")); } catch { continue; }
+        handleMessage(sock, msg);
+      }
+    }
+  });
+
+  sock.on("close", () => cleanup(sock));
+  sock.on("error", () => cleanup(sock));
+});
+
+function cleanup(sock) {
+  allClients.delete(sock);
+  const room = sock.room;
+  if (room) {
+    room.clients.delete(sock);
+    broadcast(room, { type: "chat", system: true, text: `${sock.userName} left the room` });
+    broadcast(room, presence(room));
+    if (room.clients.size === 0) rooms.delete(room.code);
+  }
+  sock.room = null;
+}
+
+function handleMessage(sock, msg) {
+  const room = sock.room;
+
+  switch (msg.type) {
+    case "join": {
+      const code = String(msg.room || "LOBBY").toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 20) || "LOBBY";
+      const name = String(msg.name || "Guest").slice(0, 24) || "Guest";
+      sock.userName = name;
+      let r = rooms.get(code);
+      if (!r) {
+        r = makeRoom(code);
+        rooms.set(code, r);
+      }
+      r.clients.add(sock);
+      sock.room = r;
+      if (!(name in r.scores)) r.scores[name] = 0;
+      send(sock, { type: "joined", room: code, you: name });
+      send(sock, fullSync(r));
+      broadcast(r, { type: "chat", system: true, text: `${name} joined the room` });
+      broadcast(r, presence(r));
+      break;
+    }
+
+    case "chat": {
+      if (!room) return;
+      const text = String(msg.text || "").slice(0, 400);
+      if (!text.trim()) return;
+      broadcast(room, { type: "chat", name: sock.userName, text });
+      break;
+    }
+
+    case "control": {
+      if (!room) return;
+      const s = room.state;
+      const t = Math.max(0, Number(msg.time) || 0);
+      if (msg.action === "play") {
+        s.time = t; s.playing = true; s.updatedAt = Date.now();
+        broadcast(room, { type: "control", action: "play", time: t, by: sock.userName });
+      } else if (msg.action === "pause") {
+        s.time = t; s.playing = false; s.updatedAt = Date.now();
+        broadcast(room, { type: "control", action: "pause", time: t, by: sock.userName });
+      } else if (msg.action === "seek") {
+        s.time = t; s.updatedAt = Date.now();
+        broadcast(room, { type: "control", action: "seek", time: t, playing: s.playing, by: sock.userName });
+      }
+      break;
+    }
+
+    case "selectMovie": {
+      if (!room) return;
+      const file = safeName(msg.file);
+      if (!fs.existsSync(path.join(MOVIE_DIR, file))) return;
+      room.state = { movie: file, playing: false, time: 0, updatedAt: Date.now() };
+      broadcast(room, { type: "movie", file, by: sock.userName });
+      break;
+    }
+
+    case "answer": {
+      if (!room) return;
+      if (msg.correct) room.scores[sock.userName] = (room.scores[sock.userName] || 0) + 1;
+      broadcast(room, presence(room));
+      broadcast(room, {
+        type: "chat", system: true,
+        text: `${sock.userName} answered round ${Number(msg.round) || "?"} ${msg.correct ? "correctly 🎉" : "wrong 😅"}`,
+      });
+      break;
+    }
+
+    case "nextRound": {
+      if (!room) return;
+      room.round = (Number(msg.round) || room.round + 1);
+      broadcast(room, { type: "round", round: room.round });
+      break;
+    }
+
+    case "syncRequest": {
+      if (!room) return;
+      send(sock, fullSync(room));
+      break;
+    }
+  }
+}
+
+server.listen(PORT, () => {
+  console.log("");
+  console.log("  WatchTogether is running!");
+  console.log(`  Open        http://localhost:${PORT}`);
+  console.log("  On your network, friends on the same wifi can use your local IP.");
+  console.log("  To go worldwide, deploy this folder to Railway / Render / a VPS.");
+  console.log("");
+});
