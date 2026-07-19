@@ -230,10 +230,18 @@ function fullSync(room) {
 
 server.on("upgrade", (req, sock) => {
   const key = req.headers["sec-websocket-key"];
-  if (!key || req.url !== "/ws") {
+  // Be tolerant of how proxies (Railway, nginx, etc.) forward the URL:
+  // strip query strings and accept both "/ws" and absolute-form URLs.
+  let upath = String(req.url || "").split("?")[0];
+  try { upath = new URL(upath, "http://x").pathname; } catch {}
+  console.log("WS upgrade request:", req.url, "->", upath);
+  if (!key || !upath.endsWith("/ws")) {
+    sock.write("HTTP/1.1 400 Bad Request\r\n\r\n");
     sock.destroy();
     return;
   }
+  sock.setNoDelay(true);
+  sock.setKeepAlive(true, 30000);
   const accept = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
   sock.write(
     "HTTP/1.1 101 Switching Protocols\r\n" +
@@ -396,7 +404,15 @@ function handleMessage(sock, msg) {
   }
 }
 
-server.listen(PORT, () => {
+/* Heartbeat: ping every client every 25s so hosting proxies
+   don't close the connection for being idle. */
+setInterval(() => {
+  for (const c of allClients) {
+    if (!c.destroyed) c.write(Buffer.from([0x89, 0x00])); // WS ping frame
+  }
+}, 25000);
+
+server.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("  WatchTogether is running!");
   console.log(`  Open        http://localhost:${PORT}`);
