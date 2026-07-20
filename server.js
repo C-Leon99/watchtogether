@@ -1,5 +1,5 @@
 /*
- * WatchTogether server — zero dependencies, pure Node.js (v18+).
+ * Mova server — zero dependencies, pure Node.js (v18+).
  * Run with:  node server.js
  * Then open  http://localhost:3000  in Chrome (and share your address with friends).
  *
@@ -105,6 +105,20 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  /* ---- delete a movie ---- */
+  if (req.method === "DELETE" && p === "/api/delete") {
+    const name = safeName(url.searchParams.get("name"));
+    if (!name) return json(res, 400, { error: "No filename given" });
+    const file = path.join(MOVIE_DIR, name);
+    if (!fs.existsSync(file)) return json(res, 404, { error: "File not found" });
+    fs.rm(file, (err) => {
+      if (err) return json(res, 500, { error: "Could not delete the file." });
+      json(res, 200, { ok: true, deleted: name });
+      broadcastAll({ type: "library" }); // tell every room the library changed
+    });
+    return;
+  }
+
   /* ---- movie streaming with Range support (lets the player seek) ---- */
   if (req.method === "GET" && p.startsWith("/movies/")) {
     const name = safeName(p.slice("/movies/".length));
@@ -168,6 +182,7 @@ function makeRoom(code) {
     clients: new Set(),
     state: {
       movie: null,      // filename in ./movies
+      stream: null,     // external video / live stream URL
       playing: false,
       time: 0,          // seconds at the moment of updatedAt
       updatedAt: Date.now(),
@@ -222,6 +237,7 @@ function fullSync(room) {
   return {
     type: "sync",
     movie: room.state.movie,
+    stream: room.state.stream,
     playing: room.state.playing,
     time: roomCurrentTime(room),
     round: room.round,
@@ -373,8 +389,17 @@ function handleMessage(sock, msg) {
       if (!room) return;
       const file = safeName(msg.file);
       if (!fs.existsSync(path.join(MOVIE_DIR, file))) return;
-      room.state = { movie: file, playing: false, time: 0, updatedAt: Date.now() };
+      room.state = { movie: file, stream: null, playing: false, time: 0, updatedAt: Date.now() };
       broadcast(room, { type: "movie", file, by: sock.userName });
+      break;
+    }
+
+    case "selectStream": {
+      if (!room) return;
+      const url = String(msg.url || "").slice(0, 2000);
+      if (!/^https?:\/\//i.test(url)) return;
+      room.state = { movie: null, stream: url, playing: false, time: 0, updatedAt: Date.now() };
+      broadcast(room, { type: "stream", url, by: sock.userName });
       break;
     }
 
@@ -414,7 +439,7 @@ setInterval(() => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log("");
-  console.log("  WatchTogether is running!");
+  console.log("  Mova is running!");
   console.log(`  Open        http://localhost:${PORT}`);
   console.log("  On your network, friends on the same wifi can use your local IP.");
   console.log("  To go worldwide, deploy this folder to Railway / Render / a VPS.");
