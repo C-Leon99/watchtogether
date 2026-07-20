@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WatchTogether</title>
+<title>Mova</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -129,6 +129,8 @@
   .scorebar{display:flex;gap:12px;font-size:12.5px;color:var(--dim);padding-top:4px;border-top:1px solid var(--line);flex-wrap:wrap}
   .scorebar b{color:var(--text)}
 
+  .movie-row .delete{background:var(--rose);color:#fff;padding:6px 10px;font-size:12px;font-weight:600}
+  .movie-row .delete:hover{background:#ff4d7f}
   footer{text-align:center;color:#5c5a72;font-size:12px;padding:18px;border-top:1px solid var(--line);margin-top:8px}
 </style>
 </head>
@@ -137,7 +139,7 @@
 <!-- ================= JOIN ================= -->
 <div id="joinView">
   <div class="join-card">
-    <h1>Watch<em>Together</em></h1>
+    <h1>Mo<em>va</em></h1>
     <p>Watch the same movie at the same moment as your friends — synced play, pause, chat, and trivia. Everyone joins with the same room code.</p>
     <div>
       <label for="jName">Your name</label>
@@ -155,7 +157,7 @@
 <!-- ================= APP ================= -->
 <div id="appView">
   <div class="topbar">
-    <div class="logo">Watch<em>Together</em></div>
+    <div class="logo">Mo<em>va</em></div>
     <div class="room-pill">Room <b id="roomLabel">—</b> · <span id="userCount">1</span> watching</div>
     <div class="sync-state"><span class="sync-dot" id="syncDot"></span><span id="syncLabel">Connected</span></div>
   </div>
@@ -168,7 +170,12 @@
         <div class="upload-row">
           <button class="upload-btn" id="uploadBtn">⬆ Upload a movie file (mp4 / webm…)</button>
           <span class="upload-progress" id="uploadProgress"></span>
-          <input type="file" id="uploadFile" accept="video/*,.mkv" hidden>
+          <input type="file" id="uploadFile" accept="video/*,.mkv" hidden multiple>
+        </div>
+        <div class="upload-row">
+          <input id="streamUrl" placeholder="Or paste a video / live stream link (.mp4, .m3u8 …)"
+                 style="flex:1;background:var(--surface-2);border:1px solid var(--line);border-radius:10px;color:var(--text);padding:9px 12px;font:inherit;font-size:13px">
+          <button class="ctl" id="streamBtn">▶ Play link</button>
         </div>
       </div>
 
@@ -194,7 +201,8 @@
           <input type="range" id="seek" min="0" max="100" value="0" step="0.1" aria-label="Seek" disabled>
           <span class="time" id="durTime">0:00</span>
         </div>
-        <button class="ctl" id="muteBtn">🔊</button>
+        <button class="ctl" id="muteBtn" title="Mute / unmute">🔊</button>
+        <input type="range" id="volSlider" min="0" max="100" value="100" step="1" aria-label="Volume" title="Volume" style="width:90px;accent-color:var(--violet)">
         <button class="ctl" id="camBtn">📷 Camera</button>
       </div>
     </div>
@@ -277,12 +285,21 @@ function handle(msg){
       break;
 
     case "sync": // full state on join / request
-      if(msg.movie) setMovie(msg.movie, false);
-      if(msg.movie){
+      if(msg.stream){
+        if(msg.stream !== currentStream) setStream(msg.stream);
+      } else if(msg.movie && msg.movie !== currentMovie){
+        setMovie(msg.movie, false);
+      }
+      if(msg.movie || msg.stream){
         applyingRemote = true;
-        v.currentTime = msg.time || 0;
-        if(msg.playing) v.play().catch(()=>{}); else v.pause();
-        applyingRemote = false;
+        // Only nudge the clock when we've truly drifted (files only — live streams manage their own clock)
+        if(!currentStream && isFinite(v.duration)){
+          const drift = Math.abs(v.currentTime - (msg.time || 0));
+          if(drift > 1.5) v.currentTime = msg.time || 0;
+        }
+        if(msg.playing && v.paused) v.play().catch(()=>{});
+        else if(!msg.playing && !v.paused) v.pause();
+        setTimeout(()=>{ applyingRemote = false; }, 150);
       }
       if(msg.round) setRound(msg.round, false);
       break;
@@ -302,8 +319,14 @@ function handle(msg){
       break;
 
     case "movie":
-      setMovie(msg.file, false);
+      if(msg.file !== currentMovie) setMovie(msg.file, false);
       flashSync(`${msg.by} put on ${msg.file}`);
+      break;
+
+    case "stream":
+      if(msg.url !== currentStream) setStream(msg.url);
+      flashSync(`${msg.by} started a stream`);
+      addMsg("sys","", `${msg.by} is playing a link: ${msg.url.slice(0,80)}`);
       break;
 
     case "control":
@@ -349,10 +372,18 @@ async function loadLibrary(){
       row.className = "movie-row";
       row.innerHTML = `
         <button class="pick ${m.file===currentMovie?"playing":""}" title="Play this for the whole room">🎞 ${esc(m.file)}</button>
-        <span class="size">${fmtSize(m.size)}</span>`;
+        <span class="size">${fmtSize(m.size)}</span>
+        <button class="delete" title="Remove this movie">✕</button>`;
       row.querySelector(".pick").addEventListener("click", ()=>{
         wsSend({ type:"selectMovie", file:m.file });
         setMovie(m.file, false);
+      });
+      row.querySelector(".delete").addEventListener("click", ()=>{
+        if(confirm(`Remove "${m.file}" from the library?`)){
+          wsSend({ type:"deleteMovie", file:m.file });
+          fetch("/api/delete?name=" + encodeURIComponent(m.file), { method:"DELETE" }).catch(()=>{});
+          loadLibrary();
+        }
       });
       list.appendChild(row);
     }
@@ -363,26 +394,30 @@ async function loadLibrary(){
 
 $("uploadBtn").addEventListener("click", ()=> $("uploadFile").click());
 $("uploadFile").addEventListener("change", async (e)=>{
-  const file = e.target.files[0];
-  if(!file) return;
+  const files = Array.from(e.target.files);
+  if(files.length===0) return;
   const prog = $("uploadProgress");
-  prog.textContent = "Uploading… 0%";
+  let uploaded = 0;
   try{
-    await new Promise((resolve, reject)=>{
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", "/api/upload?name=" + encodeURIComponent(file.name));
-      xhr.upload.onprogress = (ev)=>{
-        if(ev.lengthComputable) prog.textContent = "Uploading… " + Math.round(ev.loaded/ev.total*100) + "%";
-      };
-      xhr.onload = ()=> xhr.status===200 ? resolve() : reject(new Error(xhr.responseText));
-      xhr.onerror = ()=> reject(new Error("network"));
-      xhr.send(file);
-    });
-    prog.textContent = "Done ✓";
+    for(const file of files){
+      prog.textContent = `Uploading ${uploaded+1}/${files.length}…`;
+      await new Promise((resolve, reject)=>{
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", "/api/upload?name=" + encodeURIComponent(file.name));
+        xhr.upload.onprogress = (ev)=>{
+          if(ev.lengthComputable) prog.textContent = `Uploading ${uploaded+1}/${files.length}… ${Math.round(ev.loaded/ev.total*100)}%`;
+        };
+        xhr.onload = ()=> xhr.status===200 ? resolve() : reject(new Error(xhr.responseText));
+        xhr.onerror = ()=> reject(new Error("network"));
+        xhr.send(file);
+      });
+      uploaded++;
+    }
+    prog.textContent = `Done ✓ (${uploaded} file${uploaded===1?"":"s"})`;
     setTimeout(()=>{ prog.textContent = ""; }, 2500);
     loadLibrary();
   }catch(err){
-    prog.textContent = "Upload failed";
+    prog.textContent = `Upload failed (${uploaded}/${files.length})`;
     setTimeout(()=>{ prog.textContent = ""; }, 3000);
   }
   e.target.value = "";
@@ -390,9 +425,16 @@ $("uploadFile").addEventListener("change", async (e)=>{
 
 /* ================= player ================= */
 const v = $("mainVideo");
+let currentStream = null, hlsPlayer = null;
+
+function clearHls(){
+  if(hlsPlayer){ try{ hlsPlayer.destroy(); }catch{} hlsPlayer = null; }
+}
 
 function setMovie(file, announce){
   currentMovie = file;
+  currentStream = null;
+  clearHls();
   $("noMovie").style.display = "none";
   applyingRemote = true;
   v.src = "/movies/" + encodeURIComponent(file);
@@ -402,6 +444,56 @@ function setMovie(file, announce){
   $("seek").disabled = false;
   loadLibrary(); // refresh highlight
 }
+
+function loadHlsLib(){
+  return new Promise((resolve, reject)=>{
+    if(window.Hls) return resolve();
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.13/hls.min.js";
+    s.onload = resolve; s.onerror = ()=>reject(new Error("hls load failed"));
+    document.head.appendChild(s);
+  });
+}
+
+async function setStream(url){
+  currentStream = url;
+  currentMovie = null;
+  clearHls();
+  $("noMovie").style.display = "none";
+  const isHls = /\.m3u8($|\?)/i.test(url);
+  try{
+    if(isHls && !v.canPlayType("application/vnd.apple.mpegurl")){
+      await loadHlsLib();
+      if(window.Hls && Hls.isSupported()){
+        hlsPlayer = new Hls();
+        hlsPlayer.loadSource(url);
+        hlsPlayer.attachMedia(v);
+      } else {
+        v.src = url; v.load();
+      }
+    } else {
+      v.src = url; v.load();
+    }
+  }catch(e){
+    addMsg("sys","","Couldn't load that stream link. Check that it's a direct video or .m3u8 link.");
+    return;
+  }
+  $("playBtn").disabled = false;
+  $("seek").disabled = false;
+  loadLibrary();
+}
+
+$("streamBtn").addEventListener("click", ()=>{
+  const url = $("streamUrl").value.trim();
+  if(!/^https?:\/\//i.test(url)){
+    addMsg("sys","","Paste a full link that starts with http:// or https:// — direct video files (.mp4, .webm) and live streams (.m3u8) work. YouTube links don't work in this version.");
+    return;
+  }
+  wsSend({ type:"selectStream", url });
+  setStream(url);
+  $("streamUrl").value = "";
+});
+$("streamUrl").addEventListener("keydown", e => { if(e.key==="Enter") $("streamBtn").click(); });
 
 v.addEventListener("loadedmetadata", ()=>{ $("durTime").textContent = fmt(v.duration); });
 v.addEventListener("timeupdate", ()=>{
@@ -426,13 +518,21 @@ $("seek").addEventListener("change", ()=>{
   v.currentTime = t;
   wsSend({ type:"control", action:"seek", time:t });
 });
+function volIcon(){
+  $("muteBtn").textContent = (v.muted || v.volume === 0) ? "🔇" : (v.volume < .5 ? "🔉" : "🔊");
+}
 $("muteBtn").addEventListener("click", ()=>{
   v.muted = !v.muted;
-  $("muteBtn").textContent = v.muted ? "🔇" : "🔊";
+  volIcon();
+});
+$("volSlider").addEventListener("input", ()=>{
+  v.volume = $("volSlider").value / 100;
+  if(v.volume > 0) v.muted = false;
+  volIcon();
 });
 
 /* gentle drift correction every 10s */
-setInterval(()=>{ if(currentMovie) wsSend({ type:"syncRequest" }); }, 10000);
+setInterval(()=>{ if(currentMovie || currentStream) wsSend({ type:"syncRequest" }); }, 10000);
 
 /* ================= local webcam preview ================= */
 let camStream = null;
@@ -481,19 +581,68 @@ $("chatInput").addEventListener("keydown", e => { if(e.key==="Enter") sendChat()
 
 /* ================= shared trivia ================= */
 const QUESTIONS = [
-  { q:"Which continent has the most countries?", opts:["Asia","Africa","Europe","South America"], a:1 },
-  { q:"What does 'FPS' mean in gaming?", opts:["Fast play system","Frames per second","First player start","Full power surge"], a:1 },
-  { q:"Which of these is a real football club?", opts:["Real Madrid","Royal Lagos","Madrid United","FC Atlantic"], a:0 },
-  { q:"Which planet is closest to the sun?", opts:["Venus","Earth","Mercury","Mars"], a:2 },
-  { q:"How many players are on a football pitch per team?", opts:["9","10","11","12"], a:2 },
+  /* ⚽ Football */
+  { cat:"⚽ Football", q:"How many players are on a football pitch per team?", opts:["9","10","11","12"], a:2 },
+  { cat:"⚽ Football", q:"Which country has won the most World Cups?", opts:["Germany","Brazil","Argentina","Italy"], a:1 },
+  { cat:"⚽ Football", q:"Which club is nicknamed 'The Red Devils'?", opts:["Liverpool","Arsenal","Manchester United","AC Milan"], a:2 },
+  { cat:"⚽ Football", q:"How long is a standard football match (without extra time)?", opts:["80 minutes","90 minutes","100 minutes","120 minutes"], a:1 },
+  { cat:"⚽ Football", q:"What is the Nigerian national team called?", opts:["Black Stars","Indomitable Lions","Super Eagles","Desert Foxes"], a:2 },
+  { cat:"⚽ Football", q:"Which award is given to the world's best footballer each year?", opts:["Golden Boot","Ballon d'Or","Champions Medal","FIFA Cup"], a:1 },
+  { cat:"⚽ Football", q:"A goalkeeper can use their hands only…", opts:["Anywhere","In their own penalty box","In the centre circle","Never"], a:1 },
+  { cat:"⚽ Football", q:"Which of these is a real football club?", opts:["Real Madrid","Royal Lagos","Madrid United","FC Atlantic"], a:0 },
+
+  /* 🎬 Movies & TV */
+  { cat:"🎬 Movies", q:"What is the name of the wizard school in Harry Potter?", opts:["Oxford","Hogwarts","Narnia","Rivendell"], a:1 },
+  { cat:"🎬 Movies", q:"Which movie features the line 'I'll be back'?", opts:["Rambo","Die Hard","The Terminator","RoboCop"], a:2 },
+  { cat:"🎬 Movies", q:"Nollywood is the film industry of which country?", opts:["Ghana","South Africa","Nigeria","Kenya"], a:2 },
+  { cat:"🎬 Movies", q:"In The Lion King, what is Simba's father called?", opts:["Scar","Mufasa","Rafiki","Zazu"], a:1 },
+  { cat:"🎬 Movies", q:"Which superhero is known as the 'Man of Steel'?", opts:["Batman","Iron Man","Superman","Thor"], a:2 },
+  { cat:"🎬 Movies", q:"What do the Avengers fight to collect in Infinity War?", opts:["Dragon balls","Infinity Stones","Power rings","Chaos emeralds"], a:1 },
+
+  /* 🎵 Music */
+  { cat:"🎵 Music", q:"Which Nigerian star sang the hit 'Essence'?", opts:["Burna Boy","Davido","Wizkid","Rema"], a:2 },
+  { cat:"🎵 Music", q:"Afrobeats originated mainly in which region?", opts:["East Africa","West Africa","North Africa","Southern Africa"], a:1 },
+  { cat:"🎵 Music", q:"How many strings does a standard guitar have?", opts:["4","5","6","7"], a:2 },
+  { cat:"🎵 Music", q:"Which artist is nicknamed 'African Giant'?", opts:["Burna Boy","Olamide","Asake","Flavour"], a:0 },
+  { cat:"🎵 Music", q:"Fela Kuti is famous for creating which genre?", opts:["Highlife","Afrobeat","Juju","Fuji"], a:1 },
+
+  /* 🌍 General knowledge */
+  { cat:"🌍 General", q:"Which continent has the most countries?", opts:["Asia","Africa","Europe","South America"], a:1 },
+  { cat:"🌍 General", q:"What is the largest ocean on Earth?", opts:["Atlantic","Indian","Arctic","Pacific"], a:3 },
+  { cat:"🌍 General", q:"What is the capital of Nigeria?", opts:["Lagos","Abuja","Kano","Ibadan"], a:1 },
+  { cat:"🌍 General", q:"How many colours are in a rainbow?", opts:["5","6","7","8"], a:2 },
+  { cat:"🌍 General", q:"Which is the longest river in Africa?", opts:["Niger","Congo","Nile","Zambezi"], a:2 },
+  { cat:"🌍 General", q:"What currency is used in Nigeria?", opts:["Cedi","Naira","Shilling","Rand"], a:1 },
+  { cat:"🌍 General", q:"Which language is the most spoken worldwide?", opts:["English","Hindi","Mandarin Chinese","Spanish"], a:2 },
+
+  /* 🔬 Science & tech */
+  { cat:"🔬 Science", q:"Which planet is closest to the sun?", opts:["Venus","Earth","Mercury","Mars"], a:2 },
+  { cat:"🔬 Science", q:"What does 'WWW' stand for?", opts:["World Web Wire","World Wide Web","Wide World Web","Web World Wide"], a:1 },
+  { cat:"🔬 Science", q:"Water is made of hydrogen and…", opts:["Nitrogen","Carbon","Oxygen","Helium"], a:2 },
+  { cat:"🔬 Science", q:"Which company makes the iPhone?", opts:["Samsung","Google","Apple","Huawei"], a:2 },
+  { cat:"🔬 Science", q:"How many legs does a spider have?", opts:["6","8","10","12"], a:1 },
+  { cat:"🔬 Science", q:"What gas do plants breathe in to make food?", opts:["Oxygen","Carbon dioxide","Nitrogen","Hydrogen"], a:1 },
+
+  /* 🎮 Gaming */
+  { cat:"🎮 Gaming", q:"What does 'FPS' mean in gaming?", opts:["Fast play system","Frames per second","First player start","Full power surge"], a:1 },
+  { cat:"🎮 Gaming", q:"Which game features 'Victory Royale'?", opts:["Call of Duty","FIFA","Fortnite","Minecraft"], a:2 },
+  { cat:"🎮 Gaming", q:"Mario's brother is called…", opts:["Wario","Luigi","Toad","Yoshi"], a:1 },
+  { cat:"🎮 Gaming", q:"In chess, which piece can only move diagonally?", opts:["Rook","Knight","Bishop","Queen"], a:2 },
+
+  /* 🍲 Food */
+  { cat:"🍲 Food", q:"Jollof rice is a beloved dish from which region?", opts:["East Africa","West Africa","Europe","Asia"], a:1 },
+  { cat:"🍲 Food", q:"Which fruit is known as the 'king of fruits' in Asia?", opts:["Mango","Durian","Pineapple","Banana"], a:1 },
+  { cat:"🍲 Food", q:"Sushi originally comes from which country?", opts:["China","Thailand","Japan","Korea"], a:2 },
+  { cat:"🍲 Food", q:"What is suya?", opts:["A soup","Spiced grilled meat","A rice dish","A drink"], a:1 },
 ];
 let round = 1, answeredThisRound = false;
 
 function setRound(r, announce){
   round = r;
   answeredThisRound = false;
-  $("roundLabel").textContent = "Round " + round;
-  const cur = QUESTIONS[(round-1) % QUESTIONS.length];
+  // stride of 17 hops between categories but is identical for everyone in the room
+  const cur = QUESTIONS[((round-1) * 17) % QUESTIONS.length];
+  $("roundLabel").textContent = "Round " + round + " · " + cur.cat;
   $("qText").textContent = cur.q;
   const box = $("opts");
   box.innerHTML = "";
