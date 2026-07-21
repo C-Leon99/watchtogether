@@ -70,6 +70,55 @@ const server = http.createServer((req, res) => {
     return json(res, 200, { movies: files });
   }
 
+  /* ---- chunked upload: big files sent piece by piece ----
+   *  POST /api/upload-chunk?name=movie.mp4&offset=0&last=0
+   *  Client sends chunks in order. `offset` must equal current .part size.
+   *  If it doesn't match (e.g. after a retry), we reply with the size we
+   *  have so the client can resume from there. `last=1` finalizes the file.
+   */
+  if (req.method === "POST" && p === "/api/upload-chunk") {
+    const name = safeName(url.searchParams.get("name"));
+    const ext = path.extname(name).toLowerCase();
+    if (!name || !ALLOWED_EXT.has(ext)) {
+      return json(res, 400, { error: "Give the file a video name like movie.mp4 (mp4, webm, mkv, mov, m4v, ogg)." });
+    }
+    const offset = parseInt(url.searchParams.get("offset") || "0", 10);
+    const isLast = url.searchParams.get("last") === "1";
+    const dest = path.join(MOVIE_DIR, name);
+    const tmp = dest + ".part";
+
+    const have = fs.existsSync(tmp) ? fs.statSync(tmp).size : 0;
+    if (offset !== have) {
+      // client is out of sync (retry/resume) — tell it where we are
+      req.resume();
+      return json(res, 409, { resumeAt: have });
+    }
+    if (have > MAX_UPLOAD_BYTES) {
+      req.resume();
+      fs.rm(tmp, { force: true }, () => {});
+      return json(res, 413, { error: "File too large." });
+    }
+
+    const out = fs.createWriteStream(tmp, { flags: "a" });
+    req.pipe(out);
+    out.on("finish", () => {
+      const size = fs.existsSync(tmp) ? fs.statSync(tmp).size : 0;
+      if (isLast) {
+        fs.rename(tmp, dest, (err) => {
+          if (err) return json(res, 500, { error: "Could not save the file." });
+          json(res, 200, { ok: true, done: true, file: name, size });
+          broadcastAll({ type: "library" });
+        });
+      } else {
+        json(res, 200, { ok: true, size });
+      }
+    });
+    out.on("error", () => {
+      json(res, 500, { error: "Write failed." });
+    });
+    return;
+  }
+
   /* ---- upload: raw body PUT/POST with filename in query ---- */
   if ((req.method === "POST" || req.method === "PUT") && p === "/api/upload") {
     const name = safeName(url.searchParams.get("name"));
