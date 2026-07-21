@@ -393,6 +393,38 @@ async function loadLibrary(){
 }
 
 $("uploadBtn").addEventListener("click", ()=> $("uploadFile").click());
+const CHUNK_SIZE = 8 * 1024 * 1024; // 8 MB pieces — survives shaky connections
+
+async function sendChunk(file, offset, isLast){
+  const blob = file.slice(offset, Math.min(offset + CHUNK_SIZE, file.size));
+  const url = `/api/upload-chunk?name=${encodeURIComponent(file.name)}&offset=${offset}&last=${isLast?1:0}`;
+  const resp = await fetch(url, { method:"POST", body: blob });
+  const data = await resp.json().catch(()=> ({}));
+  if(resp.status === 409 && typeof data.resumeAt === "number") return { resumeAt: data.resumeAt };
+  if(!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
+  return { size: data.size };
+}
+
+async function uploadFileChunked(file, label, prog){
+  let offset = 0;
+  let failures = 0;
+  while(offset < file.size){
+    const isLast = offset + CHUNK_SIZE >= file.size;
+    try{
+      const r = await sendChunk(file, offset, isLast);
+      if(typeof r.resumeAt === "number"){ offset = r.resumeAt; continue; }
+      offset = Math.min(offset + CHUNK_SIZE, file.size);
+      failures = 0;
+      prog.textContent = `${label} ${Math.round(offset/file.size*100)}%`;
+    }catch(err){
+      failures++;
+      if(failures > 5) throw err;
+      prog.textContent = `${label} retrying…`;
+      await new Promise(r=> setTimeout(r, 1500 * failures)); // wait, then retry same chunk
+    }
+  }
+}
+
 $("uploadFile").addEventListener("change", async (e)=>{
   const files = Array.from(e.target.files);
   if(files.length===0) return;
@@ -400,25 +432,17 @@ $("uploadFile").addEventListener("change", async (e)=>{
   let uploaded = 0;
   try{
     for(const file of files){
-      prog.textContent = `Uploading ${uploaded+1}/${files.length}…`;
-      await new Promise((resolve, reject)=>{
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", "/api/upload?name=" + encodeURIComponent(file.name));
-        xhr.upload.onprogress = (ev)=>{
-          if(ev.lengthComputable) prog.textContent = `Uploading ${uploaded+1}/${files.length}… ${Math.round(ev.loaded/ev.total*100)}%`;
-        };
-        xhr.onload = ()=> xhr.status===200 ? resolve() : reject(new Error(xhr.responseText));
-        xhr.onerror = ()=> reject(new Error("network"));
-        xhr.send(file);
-      });
+      const label = `Uploading ${uploaded+1}/${files.length}…`;
+      prog.textContent = label;
+      await uploadFileChunked(file, label, prog);
       uploaded++;
     }
     prog.textContent = `Done ✓ (${uploaded} file${uploaded===1?"":"s"})`;
     setTimeout(()=>{ prog.textContent = ""; }, 2500);
     loadLibrary();
   }catch(err){
-    prog.textContent = `Upload failed (${uploaded}/${files.length})`;
-    setTimeout(()=>{ prog.textContent = ""; }, 3000);
+    prog.textContent = `Upload failed (${uploaded}/${files.length}) — try again, it will resume`;
+    setTimeout(()=>{ prog.textContent = ""; }, 4000);
   }
   e.target.value = "";
 });
