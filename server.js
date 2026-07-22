@@ -344,6 +344,7 @@ server.on("upgrade", (req, sock) => {
 
   sock.userName = "Guest";
   sock.room = null;
+  sock.peerId = crypto.randomBytes(6).toString("hex");
   allClients.add(sock);
 
   let buffer = Buffer.alloc(0);
@@ -408,9 +409,16 @@ function cleanup(sock) {
     room.clients.delete(sock);
     broadcast(room, { type: "chat", system: true, text: `${sock.userName} left the room` });
     broadcast(room, presence(room));
+    broadcast(room, { type: "rtc-peer-left", peerId: sock.peerId });
     if (room.clients.size === 0) rooms.delete(room.code);
   }
   sock.room = null;
+}
+
+/** Find a socket in a room by its peerId (used to route WebRTC signaling). */
+function findPeer(room, peerId) {
+  for (const c of room.clients) if (c.peerId === peerId) return c;
+  return null;
 }
 
 function handleMessage(sock, msg) {
@@ -433,6 +441,13 @@ function handleMessage(sock, msg) {
       send(sock, fullSync(r));
       broadcast(r, { type: "chat", system: true, text: `${name} joined the room` });
       broadcast(r, presence(r));
+      // Video chat: tell the newcomer who's already here (they'll call each one),
+      // and tell everyone already here that a new peer exists (they just wait for a call).
+      send(sock, {
+        type: "rtc-peers",
+        peers: [...r.clients].filter((c) => c !== sock).map((c) => ({ peerId: c.peerId, name: c.userName })),
+      });
+      broadcast(r, { type: "rtc-peer-joined", peerId: sock.peerId, name: sock.userName }, sock);
       break;
     }
 
@@ -500,6 +515,17 @@ function handleMessage(sock, msg) {
     case "syncRequest": {
       if (!room) return;
       send(sock, fullSync(room));
+      break;
+    }
+
+    /* ---- WebRTC video chat signaling: just relay between two peers ---- */
+    case "rtc-offer":
+    case "rtc-answer":
+    case "rtc-ice": {
+      if (!room) return;
+      const target = findPeer(room, msg.to);
+      if (!target) return;
+      send(target, { ...msg, from: sock.peerId, name: sock.userName });
       break;
     }
   }
