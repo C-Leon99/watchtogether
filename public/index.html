@@ -204,6 +204,7 @@
         <button class="ctl" id="muteBtn" title="Mute / unmute">🔊</button>
         <input type="range" id="volSlider" min="0" max="100" value="100" step="1" aria-label="Volume" title="Volume" style="width:90px;accent-color:var(--violet)">
         <button class="ctl" id="camBtn">📷 Camera</button>
+        <button class="ctl" id="micBtn" hidden>🎤 Mute</button>
       </div>
     </div>
 
@@ -230,7 +231,7 @@
   </div>
 
   <footer>
-    Webcam tiles are a local preview only in this version — live face-to-face video needs WebRTC, which is the next build step.
+    Click 📷 Camera to turn on live video chat with everyone in the room. Works best on the same wifi or a normal home connection.
   </footer>
 </div>
 
@@ -302,6 +303,15 @@ function handle(msg){
         setTimeout(()=>{ applyingRemote = false; }, 150);
       }
       if(msg.round) setRound(msg.round, false);
+      break;
+
+    case "rtc-peers":
+    case "rtc-peer-joined":
+    case "rtc-peer-left":
+    case "rtc-offer":
+    case "rtc-answer":
+    case "rtc-ice":
+      handleRtc(msg);
       break;
 
     case "presence": {
@@ -576,23 +586,122 @@ $("volSlider").addEventListener("input", ()=>{
 /* gentle drift correction every 10s */
 setInterval(()=>{ if(currentMovie || currentStream) wsSend({ type:"syncRequest" }); }, 10000);
 
-/* ================= local webcam preview ================= */
-let camStream = null;
+/* ================= video chat (WebRTC mesh) ================= */
+const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+let camStream = null;           // our own mic+camera MediaStream
+const peers = {};               // peerId -> { pc: RTCPeerConnection, name }
+const camsEl = document.querySelector(".cams");
+
 $("camBtn").addEventListener("click", async ()=>{
-  if(camStream){
-    camStream.getTracks().forEach(t=>t.stop());
-    camStream = null;
-    $("myCamVideo").hidden = true; $("myAvatar").hidden = false;
+  if(camStream){ stopVideoChat(); return; }
+  try{
+    camStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
+  }catch(e){
+    addMsg("sys","","Camera/mic permission was blocked — allow it in the browser to use video chat.");
     return;
   }
-  try{
-    camStream = await navigator.mediaDevices.getUserMedia({ video:true });
-    $("myCamVideo").srcObject = camStream;
-    $("myCamVideo").hidden = false; $("myAvatar").hidden = true;
-  }catch(e){
-    addMsg("sys","","Camera permission was blocked — allow it in the browser to see your preview.");
-  }
+  $("myCamVideo").srcObject = camStream;
+  $("myCamVideo").hidden = false; $("myAvatar").hidden = true;
+  $("camBtn").textContent = "📷 Stop camera";
+  $("micBtn").hidden = false;
+
+  // We already know who's in the room (we joined earlier) — call each of them.
+  for(const peerId in knownPeers) callPeer(peerId, knownPeers[peerId]);
 });
+
+$("micBtn").addEventListener("click", ()=>{
+  if(!camStream) return;
+  const track = camStream.getAudioTracks()[0];
+  if(!track) return;
+  track.enabled = !track.enabled;
+  $("micBtn").textContent = track.enabled ? "🎤 Mute" : "🔇 Unmute";
+});
+
+function stopVideoChat(){
+  camStream.getTracks().forEach(t=>t.stop());
+  camStream = null;
+  $("myCamVideo").hidden = true; $("myAvatar").hidden = false;
+  $("camBtn").textContent = "📷 Camera";
+  $("micBtn").hidden = true;
+  for(const id in peers){ peers[id].pc.close(); removeTile(id); }
+}
+
+// Peers we know are in the room (from server), whether or not our own camera is on yet.
+const knownPeers = {}; // peerId -> name
+
+function makePC(peerId, name){
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  peers[peerId] = { pc, name };
+  if(camStream) camStream.getTracks().forEach(t => pc.addTrack(t, camStream));
+  pc.onicecandidate = (e) => { if(e.candidate) wsSend({ type:"rtc-ice", to:peerId, candidate:e.candidate }); };
+  pc.ontrack = (e) => addTile(peerId, name, e.streams[0]);
+  pc.onconnectionstatechange = () => {
+    if(["failed","closed","disconnected"].includes(pc.connectionState)) removeTile(peerId);
+  };
+  return pc;
+}
+
+async function callPeer(peerId, name){
+  if(peers[peerId]) return; // already connected/connecting
+  const pc = makePC(peerId, name);
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  wsSend({ type:"rtc-offer", to:peerId, offer });
+}
+
+async function handleRtc(msg){
+  if(msg.type === "rtc-peers"){
+    for(const p of msg.peers) knownPeers[p.peerId] = p.name;
+    if(camStream) for(const p of msg.peers) callPeer(p.peerId, p.name);
+    return;
+  }
+  if(msg.type === "rtc-peer-joined"){
+    knownPeers[msg.peerId] = msg.name;
+    // Don't call them — they'll call us (they just received the peer list and will initiate).
+    return;
+  }
+  if(msg.type === "rtc-peer-left"){
+    delete knownPeers[msg.peerId];
+    if(peers[msg.peerId]){ peers[msg.peerId].pc.close(); delete peers[msg.peerId]; }
+    removeTile(msg.peerId);
+    return;
+  }
+  if(msg.type === "rtc-offer"){
+    const pc = peers[msg.from]?.pc || makePC(msg.from, msg.name);
+    await pc.setRemoteDescription(msg.offer);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    wsSend({ type:"rtc-answer", to: msg.from, answer });
+    return;
+  }
+  if(msg.type === "rtc-answer"){
+    const p = peers[msg.from];
+    if(p) await p.pc.setRemoteDescription(msg.answer);
+    return;
+  }
+  if(msg.type === "rtc-ice"){
+    const p = peers[msg.from];
+    if(p) try{ await p.pc.addIceCandidate(msg.candidate); }catch{}
+    return;
+  }
+}
+
+function addTile(peerId, name, stream){
+  let tile = document.getElementById("cam-" + peerId);
+  if(!tile){
+    tile = document.createElement("div");
+    tile.className = "cam";
+    tile.id = "cam-" + peerId;
+    tile.innerHTML = `<video autoplay playsinline></video><div class="who"></div>`;
+    camsEl.appendChild(tile);
+  }
+  tile.querySelector(".who").textContent = name;
+  tile.querySelector("video").srcObject = stream;
+}
+function removeTile(peerId){
+  const tile = document.getElementById("cam-" + peerId);
+  if(tile) tile.remove();
+}
 
 /* ================= chat ================= */
 function addMsg(kind, name, text){
