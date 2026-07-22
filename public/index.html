@@ -165,7 +165,7 @@
   <div class="stage">
     <div class="player-wrap">
       <div class="panel">
-        <div class="panel-head">🎬 Movie library <span class="count" id="libCount"></span></div>
+        <div class="panel-head">🎬 Movie library <span class="count" id="libCount"></span><span id="storageMeter" style="margin-left:auto;font-size:11.5px;color:var(--muted);font-weight:400"></span></div>
         <div class="library-body" id="libraryList"><div class="lib-empty">Loading…</div></div>
         <div class="upload-row">
           <button class="upload-btn" id="uploadBtn">⬆ Upload a movie file (mp4 / webm…)</button>
@@ -356,7 +356,25 @@ function flashSync(text){
 }
 
 /* ================= movie library ================= */
+async function loadStorage(){
+  try{
+    const res = await fetch("/api/storage");
+    const s = await res.json();
+    const el = $("storageMeter");
+    if(s.total){
+      const usedOnDisk = s.total - s.free;
+      const pct = Math.round(usedOnDisk / s.total * 100);
+      el.textContent = `💾 ${fmtSize(usedOnDisk)} / ${fmtSize(s.total)} (${pct}%)`;
+      el.style.color = pct >= 90 ? "#ff6b6b" : "var(--muted)";
+      if(pct >= 90) el.textContent += " — drive almost full, delete a movie";
+    }else{
+      el.textContent = `💾 ${fmtSize(s.used)} used`;
+    }
+  }catch(e){ /* meter is optional, fail quietly */ }
+}
+
 async function loadLibrary(){
+  loadStorage();
   try{
     const res = await fetch("/api/movies");
     const data = await res.json();
