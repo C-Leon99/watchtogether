@@ -22,6 +22,15 @@ const ALLOWED_EXT = new Set([".mp4", ".webm", ".mkv", ".mov", ".m4v", ".ogg"]);
 
 fs.mkdirSync(MOVIE_DIR, { recursive: true });
 
+/* Clean up half-finished uploads (.part files) left by failed attempts.
+ * They eat storage silently; after a restart they can't be resumed reliably
+ * anyway, so we clear them on boot. */
+for (const f of fs.readdirSync(MOVIE_DIR)) {
+  if (f.endsWith(".part")) {
+    try { fs.rmSync(path.join(MOVIE_DIR, f)); console.log("cleaned stale upload:", f); } catch {}
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /*  HTTP                                                               */
 /* ------------------------------------------------------------------ */
@@ -159,11 +168,29 @@ const server = http.createServer((req, res) => {
     const name = safeName(url.searchParams.get("name"));
     if (!name) return json(res, 400, { error: "No filename given" });
     const file = path.join(MOVIE_DIR, name);
+    try { fs.rmSync(file + ".part", { force: true }); } catch {} // clear any half-upload too
     if (!fs.existsSync(file)) return json(res, 404, { error: "File not found" });
     fs.rm(file, (err) => {
       if (err) return json(res, 500, { error: "Could not delete the file." });
       json(res, 200, { ok: true, deleted: name });
       broadcastAll({ type: "library" }); // tell every room the library changed
+    });
+    return;
+  }
+
+  /* ---- storage meter: how full is the drive? ---- */
+  if (req.method === "GET" && p === "/api/storage") {
+    let used = 0;
+    for (const f of fs.readdirSync(MOVIE_DIR)) {
+      try { used += fs.statSync(path.join(MOVIE_DIR, f)).size; } catch {}
+    }
+    fs.statfs(MOVIE_DIR, (err, s) => {
+      if (err || !s) return json(res, 200, { used, free: null, total: null });
+      json(res, 200, {
+        used,
+        free: s.bavail * s.bsize,
+        total: s.blocks * s.bsize
+      });
     });
     return;
   }
